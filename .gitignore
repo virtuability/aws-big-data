@@ -1,0 +1,17 @@
+
+# VSCode
+*.code-workspace
+.vscode/
+
+# Cloudformation packaged templates
+*.packaged
+
+# SAM
+.aws-sam/
+
+# Build directory
+target/
+
+# python virtualenv
+.venv/
+

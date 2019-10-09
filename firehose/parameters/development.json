@@ -1,0 +1,22 @@
+[
+  {
+    "ParameterKey" : "pAppName",
+    "ParameterValue" : "firehose"
+  },
+  {
+    "ParameterKey" : "pEnvironment",
+    "ParameterValue" : "development"
+  },
+  {
+    "ParameterKey" : "pCoreStack",
+    "ParameterValue" : "core-development"
+  },
+  {
+    "ParameterKey" : "pEC2KeyName",
+    "ParameterValue" : "development"
+  },
+  {
+    "ParameterKey" : "pEC2ImageId",
+    "ParameterValue" : "ami-0bbc25e23a7640b9b"
+  }
+]

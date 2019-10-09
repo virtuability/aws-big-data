@@ -1,0 +1,2 @@
+AWS Big Data - Applications: An assortment of AWS Big Data example stacks.
+Copyright 2019 Virtuability. All Rights Reserved.

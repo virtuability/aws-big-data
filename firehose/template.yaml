@@ -1,0 +1,340 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: App stack
+
+Parameters:
+  pAppName:
+    Type: String
+    Description: Unique namespace for app stack resources
+
+  pCoreStack:
+    Type: String
+    Description: Name of the core stack that builds the VPC
+
+  pEnvironment:
+    Type: String
+    Description: App stack environment
+    AllowedValues: [ "development", "test", "production" ]
+
+  pEC2KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 SSH key pair
+
+  pEC2ImageId:
+    Type: AWS::EC2::Image::Id
+    Description: EC2 AMI
+
+Resources:
+
+  rEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: 'KMS key used to encrypt sensitive data at rest'
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            AWS:
+              - !Sub arn:aws:iam::${AWS::AccountId}:root
+          Action: kms:*
+          Resource: "*"
+
+  rEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${pAppName}-${pEnvironment}'
+      TargetKeyId: !Ref rEncryptionKey
+
+  rS3DeliveryBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${pAppName}-${pEnvironment}-delivery-bucket'
+      BucketEncryption: 
+        ServerSideEncryptionConfiguration: 
+          - ServerSideEncryptionByDefault:
+              KMSMasterKeyID: !Ref rEncryptionKey
+              SSEAlgorithm: aws:kms
+      LifecycleConfiguration:
+        Rules:
+          - AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 3
+            ExpirationInDays: 32
+            Status: Enabled
+
+  rFirehoseStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamType: 'DirectPut'
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !Sub 'arn:aws:s3:::${rS3DeliveryBucket}'
+        BufferingHints:
+          IntervalInSeconds: 300
+          SizeInMBs: 1
+        EncryptionConfiguration:
+          KMSEncryptionConfig:
+            AWSKMSKeyARN: !GetAtt rEncryptionKey.Arn
+        CompressionFormat: UNCOMPRESSED
+        Prefix: output/
+        ErrorOutputPrefix: error/
+        RoleARN: !GetAtt rFirehoseDeliveryRole.Arn
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+          - Parameters:
+            - ParameterName: LambdaArn
+              ParameterValue: !GetAtt rApacheLogToJsonTransformFunction.Arn 
+            Type: Lambda 
+
+  rFirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Ref 'AWS::AccountId'
+      Path: "/"
+      ManagedPolicyArns:
+        - !Ref rFirehoseDeliveryPolicy
+
+  rFirehoseDeliveryPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${pAppName}-${pEnvironment}-firehose-delivery-policy'
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+            - 's3:AbortMultipartUpload'
+            - 's3:GetBucketLocation'
+            - 's3:GetObject'
+            - 's3:ListBucket'
+            - 's3:ListBucketMultipartUploads'
+            - 's3:PutObject'
+            Resource:
+            - !Sub 'arn:aws:s3:::${rS3DeliveryBucket}'
+            - !Sub 'arn:aws:s3:::${rS3DeliveryBucket}/*'
+          - Effect: Allow
+            Action:
+            - 'kms:GenerateDataKey'
+            Resource:
+            - !GetAtt rEncryptionKey.Arn
+          - Effect: Allow
+            Action:
+            - 'lambda:InvokeFunction'
+            - 'lambda:GetFunctionConfiguration'
+            Resource:
+              - !GetAtt rApacheLogToJsonTransformFunction.Arn
+
+  rWebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${pAppName}-${pEnvironment} web security group'
+      VpcId:
+        Fn::ImportValue:
+          !Sub '${pCoreStack}-VPC'
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 
+          Fn::ImportValue:
+            !Sub '${pCoreStack}-VPCCidrBlock'
+
+  rWebInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref rWebInstancePolicy
+
+  rWebInstancePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action:
+          - 'firehose:PutRecord*'
+          Resource: !GetAtt rFirehoseStream.Arn
+        - Effect: Allow
+          Action:
+          - 'cloudwatch:PutMetricData'
+          Resource: '*'
+
+  rWebInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+      - Ref: rWebInstanceRole
+
+  rWebInstance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          configure:
+            - 'config_httpd'
+            - 'config_kinesis'
+        config_httpd:
+          packages:
+            yum:
+              httpd: []
+          services:
+            sysvinit:
+              httpd:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files:
+                - '/etc/httpd/httpd.conf'
+                sources:
+                - '/etc/httpd/conf.d'
+          files:
+            /etc/cron.d/generate-logs:
+              content: |
+                # Generate OK HTTP traffic every minute
+                PATH=/bin:/usr/bin:/usr/local/bin:$PATH
+                * * * * * ec2-user curl -s http://localhost --output /dev/null
+                # Generate Not Found HTTP traffic every 2nd minute
+                PATH=/bin:/usr/bin:/usr/local/bin:$PATH
+                */2 * * * * ec2-user curl -s http://localhost/i-dont-exist --output /dev/null
+              mode: '000644'
+              owner: 'root'
+              group: 'root'
+            /var/www/html/index.html:
+              content: |
+                <html>
+                  <head>
+                    <title>hello</title>
+                  </head>
+                  <body>
+                    <h1>Hello there</h1>
+                  </body>
+                </html>
+        config_kinesis:
+          commands:
+            install_kinesis_agent:
+              command: 'yum install https://s3.amazonaws.com/streaming-data-agent/aws-kinesis-agent-latest.amzn1.noarch.rpm -y'
+              ignoreErrors: 'false'
+            # Grant httpd log file access to the Kinesis agent
+            set_httpd_log_privs:
+              command: 'setfacl -Rm d:g:aws-kinesis-agent-user:rx,g:aws-kinesis-agent-user:rx /var/log/httpd'
+              ignoreErrors: 'false'
+          files:
+            # Create Kinesis agent configuration that pre-processes standard Apache
+            # logs into JSON and then sends them to the Firehose Delivery Stream
+            /etc/aws-kinesis/agent.json:
+              content: !Sub |
+                {
+                  "cloudwatch.emitMetrics": true,
+                  "kinesis.endpoint": "kinesis.${AWS::Region}.amazonaws.com",
+                  "firehose.endpoint": "firehose.${AWS::Region}.amazonaws.com",
+                  "flows": [
+                    {
+                      "filePattern": "/var/log/httpd/access_log*",
+                      "deliveryStream": "${rFirehoseStream}",
+                      "dataProcessingOptions": [
+                        {
+                          "optionName": "LOGTOJSON",
+                          "logFormat": "COMMONAPACHELOG"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              mode: '000644'
+              owner: 'root'
+              group: 'root'
+          services:
+            sysvinit:
+              aws-kinesis-agent:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files:
+                - '/etc/aws-kinesis/agent.json'
+    Properties:
+      BlockDeviceMappings:
+      # Amazon Linux (2) uses /dev/xvda - others use /dev/sda1
+      - DeviceName: /dev/xvda
+        Ebs:
+          KmsKeyId: !Ref rEncryptionKey
+          Encrypted: true
+          VolumeSize: 12
+          DeleteOnTermination: true
+      EbsOptimized: true
+      InstanceType: t3.micro
+      KeyName: !Ref pEC2KeyName
+      SecurityGroupIds: 
+      - !Ref rWebSecurityGroup
+      - Fn::ImportValue:
+          !Sub '${pCoreStack}-NatAccessSecurityGroup'
+      ImageId: !Ref pEC2ImageId
+      IamInstanceProfile: !Ref rWebInstanceProfile
+      SubnetId:
+        Fn::ImportValue:
+          !Sub '${pCoreStack}-PrivateSubnet1'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          yum -y update
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource rWebInstance --configsets configure --region ${AWS::Region}
+          /opt/aws/bin/cfn-signal --exit-code 0 --stack ${AWS::StackName} --resource rWebInstance --region ${AWS::Region}
+      Tags:
+      - Key: Name
+        Value: !Sub '${pAppName}-${pEnvironment}-web'
+
+  rApacheLogToJsonTransformFunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      FunctionName: !Sub '${pAppName}-${pEnvironment}-apache-log-to-json-transform'
+      Handler: main.lambda_handler
+      Runtime: python3.7
+      CodeUri: ./apache-log-to-json-transform/
+      MemorySize: 256
+      Timeout: 60
+      Role: !GetAtt rApacheLogToJsonTransformIAMRole.Arn
+      # Environment:
+      #   Variables:
+      #     LOG_LEVEL: !Ref pLogLevel
+
+  # TODO: Encrypt with KMS key association using a custom resource
+  rApacheLogToJsonTransformLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${rApacheLogToJsonTransformFunction}'
+      RetentionInDays: 7
+
+  rApacheLogToJsonTransformIAMRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Path: "/"
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+        - 'arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "sts:AssumeRole"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
